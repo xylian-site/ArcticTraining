@@ -30,6 +30,7 @@ import numpy as np
 import torch
 import torch.cuda
 import torch.distributed.nn
+import torch.profiler
 import wandb
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
@@ -161,8 +162,8 @@ class Trainer(ABC, CallbackMixin, metaclass=RegistryMeta):
 
         self._set_seeds(self.config.seed)
 
-        if self.config.mem_profiler == "e2e":
-            torch.cuda.memory._record_memory_history(max_entries=self.config.mem_profiler_max_entries)
+        if self.config.memory_profiler.enable == "e2e":
+            torch.cuda.memory._record_memory_history(max_entries=self.config.memory_profiler.max_entries)
 
         tokenizer_factory = self.config.tokenizer.factory(self)
         self.tokenizer = tokenizer_factory()
@@ -272,6 +273,15 @@ class Trainer(ABC, CallbackMixin, metaclass=RegistryMeta):
 
         self.metrics = Metrics(self)
 
+        self.profiler = None
+        if self.config.profiler.enable and self.global_rank == 0:
+            logger.info("Profiler is enabled, setting up...")
+            self._setup_profiler()
+        elif self.config.profiler.enable:
+            logger.info(f"Profiler enabled but skipping setup on rank {self.global_rank}")
+        else:
+            logger.info("Profiler is disabled")
+
         if self.global_rank == 0 and self.config.wandb.enable:
             # Note: wandb.init() is not type annotated so we need to use type: ignore
             self.wandb_experiment = wandb.init(  # type: ignore
@@ -287,6 +297,42 @@ class Trainer(ABC, CallbackMixin, metaclass=RegistryMeta):
         np.random.seed(seed)
         random.seed(seed)
         set_seed(seed)
+
+    def _setup_profiler(self) -> None:
+        """Setup PyTorch profiler for detailed performance analysis."""
+        from pathlib import Path
+        
+        profiler_output_dir = Path(self.config.profiler.output_dir)
+        profiler_output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Profiler output directory: {profiler_output_dir}")
+        
+        def trace_handler(prof):
+            try:
+                trace_path = profiler_output_dir / f"trace_step_{prof.step_num}_rank_{self.global_rank}.json"
+                prof.export_chrome_trace(str(trace_path))
+                logger.info(f"Saved profiler trace to {trace_path}")
+                
+                if self.config.profiler.profile_memory:
+                    memory_path = profiler_output_dir / f"memory_step_{prof.step_num}_rank_{self.global_rank}.html"
+                    try:
+                        prof.export_memory_timeline(str(memory_path), device="cuda")
+                        logger.info(f"Saved memory timeline to {memory_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save memory timeline: {e}")
+            except Exception as e:
+                logger.error(f"Failed to save profiler trace: {e}")
+        
+        self.profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=self.config.profiler.record_shapes,
+            profile_memory=self.config.profiler.profile_memory,
+            with_stack=self.config.profiler.with_stack,
+            with_flops=self.config.profiler.with_flops,
+            with_modules=True,
+            on_trace_ready=trace_handler
+        )
+        
+        logger.info(f"Profiler initialized. Will profile steps {self.config.profiler.start_step} to {self.config.profiler.end_step}")
 
     @property
     def model_unwrapped(self):
@@ -377,19 +423,56 @@ class Trainer(ABC, CallbackMixin, metaclass=RegistryMeta):
 
         self.model.train()
 
-        loss = self.loss(batch)
+        # Check if we should be profiling this step
+        should_profile = (
+            self.profiler is not None and 
+            self.config.profiler.start_step <= self.global_step <= self.config.profiler.end_step
+        )
+        
+        if self.profiler is not None:
+            logger.debug(f"Step {self.global_step}: should_profile={should_profile}, profiler_range=[{self.config.profiler.start_step}, {self.config.profiler.end_step}]")
+        
+        if should_profile and not hasattr(self, '_profiler_started'):
+            self.profiler.start()
+            self._profiler_started = True
+            logger.info(f"Started profiling at step {self.global_step}")
 
-        self.backward(loss)
+        if should_profile:
+            with torch.profiler.record_function("forward_pass"):
+                loss = self.loss(batch)
+        else:
+            loss = self.loss(batch)
+
+        if should_profile:
+            with torch.profiler.record_function("backward_pass"):
+                self.backward(loss)
+        else:
+            self.backward(loss)
 
         def maybe_item(v):
             return v.item() if torch.is_tensor(v) else v
 
         self.metrics.record("loss", maybe_item(loss))
 
-        self.model.step()
+        if should_profile:
+            with torch.profiler.record_function("optimizer_step"):
+                self.model.step()
+        else:
+            self.model.step()
 
         # DeepSpeed increments its global step after the step() call, so we use it as the golden truth
         self.global_step = self.model.global_steps
+        
+        if should_profile and hasattr(self, '_profiler_started'):
+            self.profiler.step()
+            logger.info(f"Profiler stepped at global step {self.global_step}")
+            
+        if (hasattr(self, '_profiler_started') and 
+            self.global_step > self.config.profiler.end_step):
+            self.profiler.stop()
+            logger.info(f"Stopped profiling after step {self.global_step}")
+            delattr(self, '_profiler_started')
+        
         if self.global_step >= self.training_horizon:
             self.early_stop = True
 
@@ -410,8 +493,8 @@ class Trainer(ABC, CallbackMixin, metaclass=RegistryMeta):
         self.metrics.start_timer("iter")
 
         # enable memory allocation history, which will add tracebacks and event history to memory snapshots
-        if self.config.mem_profiler == "step":
-            torch.cuda.memory._record_memory_history(max_entries=self.config.mem_profiler_max_entries)
+        if self.config.memory_profiler.enable == "step":
+            torch.cuda.memory._record_memory_history(max_entries=self.config.memory_profiler.max_entries)
 
         batch_iterator = iter(self.train_batches)
         if self.is_resume:
@@ -499,8 +582,15 @@ class Trainer(ABC, CallbackMixin, metaclass=RegistryMeta):
             # logger.info(f"{self._trainer_state}")
             raise (e)
         finally:
-            if self.config.mem_profiler is not None:
-                torch.cuda.memory._dump_snapshot(self.config.mem_profiler_dir / f"{self.global_rank}.pickle")
+            if hasattr(self, '_profiler_started') and self.profiler is not None:
+                try:
+                    self.profiler.stop()
+                    logger.info("Profiler stopped and traces saved")
+                except Exception as e:
+                    logger.warning(f"Error stopping profiler: {e}")
+            
+            if self.config.memory_profiler.enable is not None:
+                torch.cuda.memory._dump_snapshot(self.config.memory_profiler.output_dir / f"{self.global_rank}.pickle")
 
             if self.wandb_experiment is not None:
                 self.wandb_experiment.finish()

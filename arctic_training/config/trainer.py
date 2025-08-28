@@ -42,6 +42,8 @@ from arctic_training.config.enums import DType
 from arctic_training.config.logger import LoggerConfig
 from arctic_training.config.model import ModelConfig
 from arctic_training.config.optimizer import OptimizerConfig
+from arctic_training.config.profiler import MemoryProfilerConfig
+from arctic_training.config.profiler import ProfilerConfig
 from arctic_training.config.scheduler import SchedulerConfig
 from arctic_training.config.tokenizer import TokenizerConfig
 from arctic_training.config.utils import HumanInt
@@ -156,14 +158,11 @@ class TrainerConfig(BaseConfig):
     overfit_first_batch: bool = False
     """ Train only on repetitions of the first training batch. Useful for development. """
 
-    mem_profiler: Literal[None, "step", "e2e"] = None
-    """ Enable memory profiling. """
+    profiler: ProfilerConfig = Field(default_factory=ProfilerConfig)
+    """ Profiler configuration. """
 
-    mem_profiler_dir: Path = Field(default_factory=lambda data: data["logger"].output_dir / "mem-prof")
-    """ Path to save memory profiling results. Defaults to `logger.output_dir/mem-prof`. """
-
-    mem_profiler_max_entries: HumanInt = Field(default=100_000, ge=1)
-    """ Maximum number of entries to store in the memory profiler. """
+    memory_profiler: MemoryProfilerConfig = Field(default_factory=MemoryProfilerConfig)
+    """ Memory profiler configuration. """
 
     kill_switch_path: Path = Path("/tmp/at_kill_switch")
     """ Path to a file that can be used to trigger a graceful shutdown mid-training (sets early exit to True). """
@@ -422,8 +421,8 @@ class TrainerConfig(BaseConfig):
 
     @model_validator(mode="after")
     def mem_profiler_mkdir(self) -> Self:
-        if self.mem_profiler is not None:
-            self.mem_profiler_dir.mkdir(parents=True, exist_ok=True)
+        if self.memory_profiler.enable is not None:
+            self.memory_profiler.output_dir.mkdir(parents=True, exist_ok=True)
         return self
 
 

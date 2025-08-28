@@ -26,6 +26,8 @@ from arctic_training.config.data import DataConfig
 from arctic_training.config.logger import LoggerConfig
 from arctic_training.config.model import ModelConfig
 from arctic_training.config.optimizer import OptimizerConfig
+from arctic_training.config.profiler import MemoryProfilerConfig
+from arctic_training.config.profiler import ProfilerConfig
 from arctic_training.config.scheduler import SchedulerConfig
 from arctic_training.config.tokenizer import TokenizerConfig
 from arctic_training.config.trainer import TrainerConfig
