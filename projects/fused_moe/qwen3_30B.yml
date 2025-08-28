@@ -1,0 +1,55 @@
+type: sft
+micro_batch_size: 4
+exit_iteration: 10
+min_iterations: 10
+sequence_parallel_size: 1
+
+deepspeed:
+  zero_optimization:
+    stage: 3
+
+model:
+  name_or_path: Qwen/Qwen3-30B-A3B
+  attn_implementation: flash_attention_2
+
+profiler:
+  enable: true
+  start_step: 5
+  end_step: 6
+  output_dir: "./profiler_traces"
+  schedule_wait: 1
+  schedule_warmup: 1  
+  schedule_active: 2
+  record_shapes: true
+  profile_memory: true
+  with_stack: true
+  with_flops: true
+
+memory_profiler:
+  enable: "step"  # Options: null, "step", "e2e"
+  output_dir: "./mem_snapshots"
+  max_entries: 100000
+
+data:
+  sources:
+    - type: huggingface_instruct
+      name_or_path: HuggingFaceH4/ultrachat_200k
+      split: train_sft
+      role_mapping:
+        user: messages.role.user
+        assistant: messages.role.assistant
+
+  cache_dir: data-cache
+  dl_num_workers: 1
+
+  max_length: 4096
+
+logger:
+  level: WARNING
+  output_dir: "logs"
+  print_output_ranks: [0,1,2,3,4,5,6,7]
+
+checkpoint:
+  - type: huggingface
+    save_end_of_training: false
+    output_dir: ./fine-tuned-model
