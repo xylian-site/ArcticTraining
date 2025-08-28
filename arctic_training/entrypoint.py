@@ -13,6 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# # --- hang/debug helpers: add at top ---
+# import faulthandler, signal, sys
+
+# # Auto-dump stacks every 60s (all threads, all ranks)
+# faulthandler.dump_traceback_later(60, repeat=True)
+
+# try:
+#     faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+# except Exception:
+#     pass
+
+
 import argparse
 import os
 from pathlib import Path
